@@ -1,142 +1,296 @@
 import asyncio
+import json
 import os
 import re
 
 from telethon import TelegramClient
 from telethon.errors import (
     ChannelPrivateError,
+    FloodWaitError,
     InviteHashExpiredError,
     InviteHashInvalidError,
-    UserAlreadyParticipantError,
-)
-from telethon.tl.functions.messages import (
-    CheckChatInviteRequest,
-    ImportChatInviteRequest,
 )
 
-# Insert your api_id and api_hash here.
-# Note: API_ID must be an integer, and API_HASH must be a string
-API_ID = 00000000  # REPLACE WITH YOUR API_ID
-API_HASH = '000000000000'  # REPLACE WITH YOUR API_HASH
+from telethon.tl.functions.messages import CheckChatInviteRequest
 
-# Target channel. Can be one of:
-#   - A public username:         '@channel_name'
-#   - A public channel link:     'https://t.me/channel_name'
-#   - A private invite link:     'https://t.me/+AbCdEfGhIjKl'
-#   - A legacy invite link:      'https://t.me/joinchat/AbCdEfGhIjKl'
-#   - A tg:// invite link:       'tg://join?invite=AbCdEfGhIjKl'
-CHANNEL_LINK = 'https://t.me/+AbCdEfGhIjKl'  # REPLACE WITH TARGET CHANNEL
 
-# Output file name for saving posts
-OUTPUT_FILE = 'posts.txt'
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
-# Session file name to save authorization, preventing code prompt on every run
+API_ID = 00000000  # Replace with your API ID
+API_HASH = '000000000000'  # Replace with your API HASH
+
+CHANNEL_LINK = 'https://t.me/+AbCdEfGhIjKl'
+
+OUTPUT_JSON = 'posts.json'
+DOWNLOAD_DIR = 'downloads'
 SESSION_NAME = 'tg_session'
 
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+# ==========================================
+# HELPERS
+# ==========================================
 
 def extract_invite_hash(link: str):
-    """Return the invite hash if `link` is a private invite link, else None."""
+    """Extract private channel invite hash."""
+
     if not link:
         return None
+
     match = re.search(
         r'(?:t\.me/\+|t\.me/joinchat/|tg://join\?invite=)([\w-]+)',
         link,
         flags=re.IGNORECASE,
     )
+
     return match.group(1) if match else None
 
 
 def normalize_public_link(link: str) -> str:
-    """Convert a public t.me link into a plain username for get_entity()."""
+    """Convert public Telegram link into username."""
+
     if not link:
         return link
-    if re.match(r'^(?:https?://)?(?:www\.)?t\.me/', link, flags=re.IGNORECASE):
-        match = re.search(r't\.me/(?:s/)?([^/?#]+)', link, flags=re.IGNORECASE)
+
+    if re.match(
+        r'^(?:https?://)?(?:www\.)?t\.me/',
+        link,
+        flags=re.IGNORECASE,
+    ):
+        match = re.search(
+            r't\.me/(?:s/)?([^/?#]+)',
+            link,
+            flags=re.IGNORECASE,
+        )
+
         if match:
             return match.group(1)
-    return link
+
+    return link.lstrip('@')
 
 
 async def resolve_channel(client, link: str):
-    """Resolve a channel/chat entity from a username, public link, or invite link."""
+    """Resolve public or already joined private channel."""
+
     invite_hash = extract_invite_hash(link)
 
     if invite_hash:
-        # If we're already a member, grab the entity without side effects.
-        try:
-            check = await client(CheckChatInviteRequest(invite_hash))
-            # ChatInviteAlready has .chat; ChatInvitePeek is a preview for non-members.
-            chat = getattr(check, 'chat', None)
-            if chat is not None:
-                return chat
-        except (InviteHashExpiredError, InviteHashInvalidError):
-            # Let the join attempt below surface a clearer error.
-            pass
+        check = await client(CheckChatInviteRequest(invite_hash))
 
-        # Not a member yet (or we couldn't check) - join via invite.
-        try:
-            result = await client(ImportChatInviteRequest(invite_hash))
-        except UserAlreadyParticipantError:
-            # Race or stale session state: re-check to fetch the entity.
-            check = await client(CheckChatInviteRequest(invite_hash))
-            chat = getattr(check, 'chat', None)
-            if chat is None:
-                raise ValueError(
-                    "Already a participant but could not resolve the chat entity."
-                )
-            return chat
+        chat = getattr(check, 'chat', None)
 
-        if not result.chats:
-            raise ValueError("Invite import succeeded but returned no chats.")
-        return result.chats[0]
+        if chat is not None:
+            return await client.get_entity(chat)
 
-    # Public username or public link.
+        raise ValueError(
+            "You are not a participant or channel entity is unavailable."
+        )
+
     return await client.get_entity(normalize_public_link(link))
 
 
-async def main():
-    print("Connecting to Telegram...")
-    # Create the client. On first run, it will ask for your phone number and Telegram code.
-    async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
-        print("Successfully authorized! Resolving target channel...")
+# ==========================================
+# MEDIA DOWNLOAD
+# ==========================================
+
+async def download_message_media(client, message):
+
+    media_path = None
+    media_type = None
+    media_error = None
+
+    if not message.media:
+        return media_path, media_type, media_error
+
+    # Identify media type
+
+    if message.photo:
+        media_type = 'photo'
+
+    elif message.video_note:
+        # Ignore Telegram video circles
+        return None, None, None
+
+    elif message.voice:
+        media_type = 'voice'
+
+    elif message.video:
+        media_type = 'video'
+
+    else:
+        # Ignore GIFs, documents, audio files, etc.
+        return None, None, None
+
+    file_path = os.path.join(
+        DOWNLOAD_DIR,
+        f"msg_{message.id}"
+    )
+
+    try:
+        media_path = await client.download_media(
+            message,
+            file=file_path
+        )
+
+    except FloodWaitError as e:
+        print(
+            f"\n[Rate limit] Waiting {e.seconds} seconds "
+            f"for message {message.id}..."
+        )
+
+        await asyncio.sleep(e.seconds + 1)
 
         try:
-            channel = await resolve_channel(client, CHANNEL_LINK)
-            print(f"Resolved channel: {getattr(channel, 'title', CHANNEL_LINK)!r}. Fetching posts...")
+            media_path = await client.download_media(
+                message,
+                file=file_path
+            )
+
+        except Exception as retry_error:
+            media_error = str(retry_error)
+
+    except Exception as e:
+        media_error = str(e)
+
+    if media_error:
+        print(
+            f"\n[Warning] Failed to download "
+            f"{media_type} for message {message.id}: {media_error}"
+        )
+
+    return media_path, media_type, media_error
+
+
+# ==========================================
+# MAIN
+# ==========================================
+
+async def main():
+
+    print("Connecting to Telegram...")
+
+    async with TelegramClient(
+        SESSION_NAME,
+        API_ID,
+        API_HASH
+    ) as client:
+
+        print("Successfully authorized!")
+        print("Resolving target channel...")
+
+        try:
+
+            channel = await resolve_channel(
+                client,
+                CHANNEL_LINK
+            )
+
+            print(
+                f"Resolved channel: "
+                f"{getattr(channel, 'title', CHANNEL_LINK)!r}"
+            )
+
+            print("Fetching posts...\n")
 
             messages_count = 0
+            downloaded_count = 0
+            failed_count = 0
+            skipped_count = 0
 
-            # Open file for writing. encoding='utf-8' is important for emojis and non-latin characters
-            with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-                # Iterate over all messages in the channel.
-                # reverse=True means chronological order (oldest to newest)
-                # Remove reverse=True to save from newest to oldest.
-                async for message in client.iter_messages(channel, reverse=True):
-                    # Check if the message has text content
-                    if message.text:
-                        f.write(message.text + '\n')
-                        # Add a separator between posts for readability
-                        f.write('\n' + '=' * 50 + '\n\n')
-                        messages_count += 1
+            with open(
+                OUTPUT_JSON,
+                'w',
+                encoding='utf-8'
+            ) as f:
 
-                        if messages_count % 100 == 0:
-                            print(f"Downloaded {messages_count} posts...")
+                async for message in client.iter_messages(
+                    channel,
+                    reverse=True
+                ):
 
-            print(f"Done! Successfully saved {messages_count} posts to {OUTPUT_FILE}.")
+                    media_path, media_type, media_error = (
+                        await download_message_media(
+                            client,
+                            message
+                        )
+                    )
+
+                    if media_path:
+                        downloaded_count += 1
+
+                    if media_error:
+                        failed_count += 1
+
+                    if message.video_note:
+                        skipped_count += 1
+
+                    post_data = {
+                        'id': message.id,
+                        'date': (
+                            message.date.isoformat()
+                            if message.date else None
+                        ),
+                        'text': message.text or '',
+                        'views': message.views or 0,
+                        'forwards': message.forwards or 0,
+                        'grouped_id': message.grouped_id,
+                        'media_type': media_type,
+                        'file_path': media_path,
+                        'media_error': media_error,
+                    }
+
+                    f.write(
+                        json.dumps(
+                            post_data,
+                            ensure_ascii=False
+                        ) + '\n'
+                    )
+
+                    messages_count += 1
+
+                    if messages_count % 100 == 0:
+                        print(
+                            f"Processed {messages_count} posts | "
+                            f"Downloaded media: {downloaded_count} | "
+                            f"Failed: {failed_count}"
+                        )
+
+            print("\n========== EXPORT COMPLETE ==========")
+
+            print(f"Total posts: {messages_count}")
+            print(f"Downloaded media: {downloaded_count}")
+            print(f"Failed downloads: {failed_count}")
+            print(f"Skipped video circles: {skipped_count}")
+
+            print(f"\nJSON saved to: {OUTPUT_JSON}")
+
+            print(
+                f"Media saved to: "
+                f"{os.path.abspath(DOWNLOAD_DIR)}/"
+            )
 
         except InviteHashExpiredError:
-            print(f"Error: The invite link for {CHANNEL_LINK!r} has expired.")
-        except InviteHashInvalidError:
-            print(f"Error: The invite link for {CHANNEL_LINK!r} is invalid.")
-        except UserAlreadyParticipantError:
-            print(f"Error: Already a participant of {CHANNEL_LINK!r} but entity lookup failed.")
-        except ChannelPrivateError:
-            print(f"Error: Channel {CHANNEL_LINK!r} is private and cannot be accessed.")
-        except ValueError as e:
-            print(f"Error: Channel {CHANNEL_LINK!r} not found or inaccessible ({e}).")
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
+            print("Error: Invite link has expired.")
 
+        except InviteHashInvalidError:
+            print("Error: Invalid invite link.")
+
+        except ChannelPrivateError:
+            print("Error: Channel is private or inaccessible.")
+
+        except ValueError as e:
+            print(f"Error: {e}")
+
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+
+
+# ==========================================
+# ENTRY POINT
+# ==========================================
 
 if __name__ == '__main__':
     asyncio.run(main())
