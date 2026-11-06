@@ -6,10 +6,10 @@ import re
 from telethon import TelegramClient
 from telethon.errors import (
     ChannelPrivateError,
-    FloodWaitError,
     InviteHashExpiredError,
     InviteHashInvalidError,
 )
+from telethon.errors.rpcerrorlist import FloodWaitError
 
 from telethon.tl.functions.messages import CheckChatInviteRequest
 
